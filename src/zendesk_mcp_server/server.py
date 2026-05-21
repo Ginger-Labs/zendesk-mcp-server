@@ -227,7 +227,7 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_ticket_attachment",
-            description="Fetch a Zendesk ticket attachment by its content_url and return the file as base64-encoded data. Use the attachment URLs returned by get_ticket_comments. Supported types: safe images (jpeg/png/gif/webp) returned as ImageContent, and ZIP-shaped binary bundles (application/zip, application/octet-stream, application/binary — covers Notability .ntb note bundles and logs.zip diagnostic bundles) returned as TextContent with JSON `{content_type, data_base64}`. ZIP magic-byte validation is enforced. 25 MB size cap.",
+            description="Fetch a Zendesk ticket attachment by its content_url and return the file as base64-encoded data. Use the attachment URLs returned by get_ticket_comments. Supported types: safe images (jpeg/png/gif/webp) returned as ImageContent, and ZIP-shaped binary bundles (application/zip, application/x-zip-compressed, application/octet-stream, application/binary — covers Notability .ntb note bundles and logs.zip diagnostic bundles) returned as TextContent with JSON `{content_type, data_base64}`. ZIP magic-byte validation is enforced. 25 MB size cap.",
             inputSchema={
                 "type": "object",
                 "properties": {

@@ -37,7 +37,12 @@ class ZendeskClient:
         """
         try:
             ticket = self.client.tickets(id=ticket_id)
-            custom_fields = getattr(ticket, 'custom_fields', None) or []
+            raw_custom_fields = getattr(ticket, 'custom_fields', None) or []
+            custom_fields = [
+                {'id': cf.get('id'), 'value': cf.get('value')} if isinstance(cf, dict)
+                else {'id': getattr(cf, 'id', None), 'value': getattr(cf, 'value', None)}
+                for cf in raw_custom_fields
+            ]
             tags = list(getattr(ticket, 'tags', None) or [])
             return {
                 'id': ticket.id,
@@ -66,35 +71,36 @@ class ZendeskClient:
             limit: Max tickets to return. Capped at 100.
 
         Returns:
-            Dict with `view` (view metadata), `count`, and `tickets` (summary
-            list — id, subject, status, priority, description, timestamps,
-            requester_id, assignee_id, tags).
+            Dict with `view` (view metadata), `count`, `has_more` (whether the
+            view contains tickets beyond `limit`), and `tickets` (summary list
+            — id, subject, status, priority, timestamps, requester_id,
+            assignee_id, tags). `description` is intentionally omitted from the
+            per-ticket summary because descriptions can be multi-KB and blow
+            the token budget at limit=100; call `get_ticket` for full detail.
         """
         try:
             limit = max(1, min(limit, 100))
-            try:
-                view = self.client.views(id=view_id)
-                view_meta = {
-                    'id': view.id,
-                    'title': getattr(view, 'title', None),
-                    'description': getattr(view, 'description', None),
-                    'active': getattr(view, 'active', None),
-                    'position': getattr(view, 'position', None),
-                }
-            except Exception as ve:
-                view_meta = {'id': view_id, 'title': None, 'error': str(ve)}
+            view = self.client.views(id=view_id)
+            view_meta = {
+                'id': view.id,
+                'title': getattr(view, 'title', None),
+                'description': getattr(view, 'description', None),
+                'active': getattr(view, 'active', None),
+                'position': getattr(view, 'position', None),
+            }
 
             ticket_gen = self.client.views.tickets(view=view_id)
             tickets: List[Dict[str, Any]] = []
+            has_more = False
             for t in ticket_gen:
                 if len(tickets) >= limit:
+                    has_more = True
                     break
                 tickets.append({
                     'id': t.id,
                     'subject': t.subject,
                     'status': t.status,
                     'priority': t.priority,
-                    'description': t.description,
                     'created_at': str(t.created_at),
                     'updated_at': str(t.updated_at),
                     'requester_id': t.requester_id,
@@ -104,6 +110,7 @@ class ZendeskClient:
             return {
                 'view': view_meta,
                 'count': len(tickets),
+                'has_more': has_more,
                 'tickets': tickets,
             }
         except Exception as e:
@@ -114,11 +121,16 @@ class ZendeskClient:
         Return all views (filters/queues) visible to the API user, with
         their ids and titles. Useful for resolving a view name to an id
         without leaving the agent.
+
+        `active_only=True` calls zenpy's `views.active()` which hits
+        `/api/v2/views/active.json`. Passing `active=True` as a kwarg to
+        `views()` does NOT filter — it goes through __call__ to the plain
+        `/views.json` endpoint and the kwarg is dropped.
         """
         try:
-            views = self.client.views(active=active_only) if active_only else self.client.views()
+            views_iter = self.client.views.active() if active_only else self.client.views()
             result = []
-            for v in views:
+            for v in views_iter:
                 result.append({
                     'id': v.id,
                     'title': getattr(v, 'title', None),
@@ -248,6 +260,16 @@ class ZendeskClient:
                 raise ValueError(
                     f"Attachment type '{content_type}' is not allowed. "
                     f"Supported types: {sorted(self._ALLOWED_TYPES)}"
+                )
+
+            # Fail fast on declared oversize before buffering anything.
+            declared_len_raw = response.headers.get('Content-Length')
+            declared_len = None
+            if declared_len_raw is not None and declared_len_raw.isdigit():
+                declared_len = int(declared_len_raw)
+            if declared_len is not None and declared_len > self._MAX_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"Attachment exceeds the {self._MAX_ATTACHMENT_BYTES // (1024*1024)} MB size limit."
                 )
 
             # Read with size cap — stops download as soon as limit is exceeded.
