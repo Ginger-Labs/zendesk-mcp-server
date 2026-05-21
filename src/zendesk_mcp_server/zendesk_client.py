@@ -37,6 +37,13 @@ class ZendeskClient:
         """
         try:
             ticket = self.client.tickets(id=ticket_id)
+            raw_custom_fields = getattr(ticket, 'custom_fields', None) or []
+            custom_fields = [
+                {'id': cf.get('id'), 'value': cf.get('value')} if isinstance(cf, dict)
+                else {'id': getattr(cf, 'id', None), 'value': getattr(cf, 'value', None)}
+                for cf in raw_custom_fields
+            ]
+            tags = list(getattr(ticket, 'tags', None) or [])
             return {
                 'id': ticket.id,
                 'subject': ticket.subject,
@@ -47,10 +54,114 @@ class ZendeskClient:
                 'updated_at': str(ticket.updated_at),
                 'requester_id': ticket.requester_id,
                 'assignee_id': ticket.assignee_id,
-                'organization_id': ticket.organization_id
+                'organization_id': ticket.organization_id,
+                'tags': tags,
+                'custom_fields': custom_fields,
             }
         except Exception as e:
             raise Exception(f"Failed to get ticket {ticket_id}: {str(e)}")
+
+    def get_view_tickets(self, view_id: int, limit: int = 25) -> Dict[str, Any]:
+        """
+        Return tickets in a Zendesk view (filter/queue), plus the view's own
+        metadata (title, description, etc.).
+
+        Args:
+            view_id: The Zendesk view id (the numeric id in the view URL).
+            limit: Max tickets to return. Capped at 100.
+
+        Returns:
+            Dict with `view` (view metadata), `count`, `has_more` (whether the
+            view contains tickets beyond `limit`), and `tickets` (summary list
+            — id, subject, status, priority, timestamps, requester_id,
+            assignee_id, tags). `description` is intentionally omitted from the
+            per-ticket summary because descriptions can be multi-KB and blow
+            the token budget at limit=100; call `get_ticket` for full detail.
+        """
+        try:
+            limit = max(1, min(limit, 100))
+            view = self.client.views(id=view_id)
+            view_meta = {
+                'id': view.id,
+                'title': getattr(view, 'title', None),
+                'description': getattr(view, 'description', None),
+                'active': getattr(view, 'active', None),
+                'position': getattr(view, 'position', None),
+            }
+
+            ticket_gen = self.client.views.tickets(view=view_id)
+            tickets: List[Dict[str, Any]] = []
+            has_more = False
+            for t in ticket_gen:
+                if len(tickets) >= limit:
+                    has_more = True
+                    break
+                tickets.append({
+                    'id': t.id,
+                    'subject': t.subject,
+                    'status': t.status,
+                    'priority': t.priority,
+                    'created_at': str(t.created_at),
+                    'updated_at': str(t.updated_at),
+                    'requester_id': t.requester_id,
+                    'assignee_id': t.assignee_id,
+                    'tags': list(getattr(t, 'tags', None) or []),
+                })
+            return {
+                'view': view_meta,
+                'count': len(tickets),
+                'has_more': has_more,
+                'tickets': tickets,
+            }
+        except Exception as e:
+            raise Exception(f"Failed to get tickets for view {view_id}: {str(e)}")
+
+    def list_views(self, active_only: bool = True) -> List[Dict[str, Any]]:
+        """
+        Return all views (filters/queues) visible to the API user, with
+        their ids and titles. Useful for resolving a view name to an id
+        without leaving the agent.
+
+        `active_only=True` calls zenpy's `views.active()` which hits
+        `/api/v2/views/active.json`. Passing `active=True` as a kwarg to
+        `views()` does NOT filter — it goes through __call__ to the plain
+        `/views.json` endpoint and the kwarg is dropped.
+        """
+        try:
+            views_iter = self.client.views.active() if active_only else self.client.views()
+            result = []
+            for v in views_iter:
+                result.append({
+                    'id': v.id,
+                    'title': getattr(v, 'title', None),
+                    'description': getattr(v, 'description', None),
+                    'active': getattr(v, 'active', None),
+                    'position': getattr(v, 'position', None),
+                })
+            return result
+        except Exception as e:
+            raise Exception(f"Failed to list views: {str(e)}")
+
+    def list_ticket_fields(self) -> List[Dict[str, Any]]:
+        """
+        Return all ticket field definitions in the workspace, including
+        custom fields. Used by clients to resolve custom_field ids -> names.
+        """
+        try:
+            fields = self.client.ticket_fields()
+            result = []
+            for f in fields:
+                result.append({
+                    'id': f.id,
+                    'title': getattr(f, 'title', None),
+                    'type': getattr(f, 'type', None),
+                    'description': getattr(f, 'description', None),
+                    'active': getattr(f, 'active', None),
+                    'tag': getattr(f, 'tag', None),
+                })
+            return result
+        except Exception as e:
+            raise Exception(f"Failed to list ticket fields: {str(e)}")
 
     def get_ticket_comments(self, ticket_id: int) -> List[Dict[str, Any]]:
         """
@@ -82,28 +193,53 @@ class ZendeskClient:
         except Exception as e:
             raise Exception(f"Failed to get comments for ticket {ticket_id}: {str(e)}")
 
-    # Allowed image MIME types. SVG is excluded — it can contain active XML/JS content.
+    # Allowed MIME types. Two groups:
+    #   1. Safe images (no SVG — it can carry XML/JS).
+    #   2. ZIP-shaped binary bundles. Notability .ntb files are zip archives; logs.zip is zip.
+    #      We still enforce ZIP magic bytes on these so the allowlist isn't a blank cheque
+    #      for arbitrary binaries — the caller must really be getting a zip.
     _ALLOWED_IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/gif', 'image/webp'}
+    _ALLOWED_ZIP_TYPES = {
+        'application/zip',
+        'application/x-zip-compressed',
+        'application/octet-stream',  # Zendesk's default for .ntb
+        'application/binary',         # observed verbatim on .ntb attachments via Zendesk CDN
+    }
+    _ALLOWED_TYPES = _ALLOWED_IMAGE_TYPES | _ALLOWED_ZIP_TYPES
 
     # Magic bytes (file signatures) for each allowed type.
+    # ZIP-shaped types share the standard ZIP local-file-header / end-of-central-directory magics.
+    _ZIP_MAGIC_BYTES = [
+        b'PK\x03\x04',  # local file header — every non-empty zip starts with this
+        b'PK\x05\x06',  # end of central directory record for empty zips
+        b'PK\x07\x08',  # spanned-archive marker (rare)
+    ]
     _MAGIC_BYTES: Dict[str, List[bytes]] = {
         'image/jpeg': [b'\xff\xd8\xff'],
         'image/png':  [b'\x89PNG\r\n\x1a\n'],
         'image/gif':  [b'GIF87a', b'GIF89a'],
         'image/webp': [b'RIFF'],  # RIFF....WEBP — checked further below
+        'application/zip':              _ZIP_MAGIC_BYTES,
+        'application/x-zip-compressed': _ZIP_MAGIC_BYTES,
+        'application/octet-stream':     _ZIP_MAGIC_BYTES,
+        'application/binary':           _ZIP_MAGIC_BYTES,
     }
 
-    # 10 MB hard cap to guard against image bombs and token budget blowout.
-    _MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+    # 25 MB hard cap. Images stay token-budget-safe; .ntb files (Notability note bundles)
+    # routinely run 5-20 MB when they carry imported PDFs.
+    _MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
     def get_ticket_attachment(self, content_url: str) -> Dict[str, Any]:
         """
-        Fetch an image attachment and return base64-encoded data.
+        Fetch an attachment and return base64-encoded data.
 
         Security measures applied:
-        - Allowlist of safe image MIME types (no SVG or arbitrary binary).
+        - Allowlist of MIME types: safe images plus ZIP-shaped binary bundles
+          (Notability .ntb files are zip archives; logs.zip is zip).
         - Magic byte validation so the file header must match the declared type.
-        - 10 MB size cap to prevent image bombs and excessive token usage.
+          For ZIP-shaped allowlisted MIME types, we enforce the standard ZIP signature,
+          so the binary allowlist is not a blank cheque for arbitrary content.
+        - 25 MB size cap to prevent image bombs and excessive token usage.
 
         Zendesk attachment URLs redirect to zdusercontent.com (Zendesk's CDN).
         requests strips the Authorization header on cross-origin redirects,
@@ -120,10 +256,20 @@ class ZendeskClient:
 
             content_type = response.headers.get('Content-Type', '').split(';')[0].strip().lower()
 
-            if content_type not in self._ALLOWED_IMAGE_TYPES:
+            if content_type not in self._ALLOWED_TYPES:
                 raise ValueError(
                     f"Attachment type '{content_type}' is not allowed. "
-                    f"Supported types: {sorted(self._ALLOWED_IMAGE_TYPES)}"
+                    f"Supported types: {sorted(self._ALLOWED_TYPES)}"
+                )
+
+            # Fail fast on declared oversize before buffering anything.
+            declared_len_raw = response.headers.get('Content-Length')
+            declared_len = None
+            if declared_len_raw is not None and declared_len_raw.isdigit():
+                declared_len = int(declared_len_raw)
+            if declared_len is not None and declared_len > self._MAX_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"Attachment exceeds the {self._MAX_ATTACHMENT_BYTES // (1024*1024)} MB size limit."
                 )
 
             # Read with size cap — stops download as soon as limit is exceeded.

@@ -227,7 +227,7 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_ticket_attachment",
-            description="Fetch a Zendesk ticket attachment by its content_url and return the file as base64-encoded data. Use the attachment URLs returned by get_ticket_comments.",
+            description="Fetch a Zendesk ticket attachment by its content_url and return the file as base64-encoded data. Use the attachment URLs returned by get_ticket_comments. Supported types: safe images (jpeg/png/gif/webp) returned as ImageContent, and ZIP-shaped binary bundles (application/zip, application/x-zip-compressed, application/octet-stream, application/binary — covers Notability .ntb note bundles and logs.zip diagnostic bundles) returned as TextContent with JSON `{content_type, data_base64}`. ZIP magic-byte validation is enforced. 25 MB size cap.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -237,6 +237,49 @@ async def handle_list_tools() -> list[types.Tool]:
                     }
                 },
                 "required": ["content_url"]
+            }
+        ),
+        types.Tool(
+            name="list_views",
+            description="List all Zendesk views (filters/queues) with their ids and titles. Use this to resolve a view title like 'iOS Server Engineering Triage (Migrated Users)' to a numeric id without leaving the agent.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "active_only": {
+                        "type": "boolean",
+                        "description": "If true, return only active views. Default true.",
+                        "default": True
+                    }
+                },
+                "required": []
+            }
+        ),
+        types.Tool(
+            name="get_view_tickets",
+            description="Return the tickets in a Zendesk view (filter/queue). The view_id is the numeric id from the view URL (e.g. https://notability.zendesk.com/agent/filters/10045803779738 -> 10045803779738). Returns a summary list (id, subject, status, tags, etc.) similar to get_tickets — call get_ticket on individual ids for full detail.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "view_id": {
+                        "type": "integer",
+                        "description": "Zendesk view id"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max tickets to return (1-100)",
+                        "default": 25
+                    }
+                },
+                "required": ["view_id"]
+            }
+        ),
+        types.Tool(
+            name="list_ticket_fields",
+            description="List all ticket field definitions in the Zendesk workspace, including custom fields. Use this to resolve custom_field ids (returned by get_ticket under custom_fields) to human-readable names like 'GitHub Issue #' or 'Fin Topic'.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
             }
         ),
         types.Tool(
@@ -276,6 +319,35 @@ async def handle_call_tool(
             return [types.TextContent(
                 type="text",
                 text=json.dumps(ticket)
+            )]
+
+        elif name == "list_views":
+            active_only = True
+            if arguments and "active_only" in arguments:
+                active_only = bool(arguments["active_only"])
+            views = zendesk_client.list_views(active_only=active_only)
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(views)
+            )]
+
+        elif name == "get_view_tickets":
+            if not arguments:
+                raise ValueError("Missing arguments")
+            result = zendesk_client.get_view_tickets(
+                view_id=arguments["view_id"],
+                limit=arguments.get("limit", 25),
+            )
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(result)
+            )]
+
+        elif name == "list_ticket_fields":
+            fields = zendesk_client.list_ticket_fields()
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(fields)
             )]
 
         elif name == "create_ticket":
