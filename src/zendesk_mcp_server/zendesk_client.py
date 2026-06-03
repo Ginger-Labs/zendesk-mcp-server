@@ -636,10 +636,17 @@ class ZendeskClient:
             if not user_ids:
                 return {'count': 0, 'users': []}
 
-            # Show Many caps at 100 ids per request.
-            ids = user_ids[:100]
-            ids_param = ','.join(str(uid) for uid in ids)
-            url = f"{self.base_url}/users/show_many.json?ids={ids_param}"
+            # Show Many caps at 100 ids per request. Fail loudly rather than
+            # silently truncating — a partial result that looks complete is a
+            # correctness trap for callers resolving a whole queue.
+            if len(user_ids) > 100:
+                raise ValueError(
+                    f"get_users accepts at most 100 ids per call, got {len(user_ids)}"
+                )
+
+            ids_param = ','.join(str(uid) for uid in user_ids)
+            params = urllib.parse.urlencode({'ids': ids_param})
+            url = f"{self.base_url}/users/show_many.json?{params}"
 
             req = urllib.request.Request(url)
             req.add_header('Authorization', self.auth_header)
@@ -686,38 +693,53 @@ class ZendeskClient:
             assignee_id: Optional agent id to scope the counts to. Omit for a
                 workspace-wide count.
             statuses: Optional list of statuses to count. Defaults to the
-                active workload (new, open, pending, hold). Zendesk's "on-hold"
-                status is queried as `hold`.
+                active workload (new, open, pending, hold). Valid values are
+                new, open, pending, hold, solved, closed; an unknown status
+                raises. Zendesk's "on-hold" status is queried as `hold`.
 
         Returns:
-            Dict with `assignee_id`, `counts` (status -> integer), and `total`
-            (sum across the requested statuses).
+            Dict with `assignee_id`, `counts` (status -> `{'count': int}`, or
+            `{'error': msg}` if that status query failed — one bad query never
+            sinks the rest), and `total` (sum across statuses that succeeded).
         """
+        valid_statuses = {'new', 'open', 'pending', 'hold', 'solved', 'closed'}
         try:
-            statuses = statuses or ['new', 'open', 'pending', 'hold']
+            if statuses is None:
+                statuses = ['new', 'open', 'pending', 'hold']
 
-            def count_one(status: str) -> int:
-                query = f"type:ticket status:{status}"
-                if assignee_id is not None:
-                    query += f" assignee:{assignee_id}"
-                params = urllib.parse.urlencode({'query': query})
-                url = f"{self.base_url}/search/count.json?{params}"
-                req = urllib.request.Request(url)
-                req.add_header('Authorization', self.auth_header)
-                req.add_header('Content-Type', 'application/json')
-                with urllib.request.urlopen(req) as response:
-                    data = json.loads(response.read().decode())
-                return int(data.get('count', 0))
+            unknown = [s for s in statuses if s not in valid_statuses]
+            if unknown:
+                raise ValueError(
+                    f"Unknown status(es) {unknown}; valid: {sorted(valid_statuses)}"
+                )
 
-            max_workers = min(len(statuses), 10)
+            def count_one(status: str) -> Dict[str, Any]:
+                try:
+                    query = f"type:ticket status:{status}"
+                    if assignee_id is not None:
+                        query += f" assignee:{assignee_id}"
+                    params = urllib.parse.urlencode({'query': query})
+                    url = f"{self.base_url}/search/count.json?{params}"
+                    req = urllib.request.Request(url)
+                    req.add_header('Authorization', self.auth_header)
+                    req.add_header('Content-Type', 'application/json')
+                    with urllib.request.urlopen(req) as response:
+                        data = json.loads(response.read().decode())
+                    return {'count': int(data.get('count', 0))}
+                except Exception as e:
+                    # One bad status query never sinks the rest of the batch.
+                    return {'error': str(e)}
+
+            max_workers = min(len(statuses), 10) if statuses else 1
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 results = list(executor.map(count_one, statuses))
 
             counts = dict(zip(statuses, results))
+            total = sum(r['count'] for r in results if 'count' in r)
             return {
                 'assignee_id': assignee_id,
                 'counts': counts,
-                'total': sum(results),
+                'total': total,
             }
         except urllib.error.HTTPError as e:
             error_body = e.read().decode() if e.fp else "No response body"

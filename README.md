@@ -161,7 +161,7 @@ Return per-status ticket counts in a single call, optionally scoped to one agent
   - `assignee_id` (integer, optional): Agent id to scope counts to. Omit for workspace-wide counts.
   - `statuses` (array[string], optional): Statuses to count — `new`, `open`, `pending`, `hold`, `solved`, `closed`. Defaults to the active workload `[new, open, pending, hold]`. Use `hold` for the on-hold status.
 
-- Output: `assignee_id`, `counts` (status → integer), and `total` (sum across the requested statuses)
+- Output: `assignee_id`, `counts` (status → `{count}`, or `{error}` if that status query failed — one bad query never sinks the rest), and `total` (sum across statuses that succeeded)
 
 ### list_views
 

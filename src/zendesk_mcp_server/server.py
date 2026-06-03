@@ -450,7 +450,10 @@ async def handle_list_tools() -> list[types.Tool]:
                     },
                     "statuses": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {
+                            "type": "string",
+                            "enum": ["new", "open", "pending", "hold", "solved", "closed"]
+                        },
                         "description": "Statuses to count (new, open, pending, hold, solved, closed). Defaults to [new, open, pending, hold]."
                     }
                 },
