@@ -345,6 +345,47 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="get_satisfaction_ratings",
+            description=(
+                "List CSAT / satisfaction ratings via the Zendesk Satisfaction "
+                "Ratings API. Each rating includes assignee_id, score (good/bad), "
+                "comment, ticket_id, and timestamps. There is no server-side "
+                "agent filter, so to rank CSAT per agent: fetch ratings (optionally "
+                "filtered by score and date range), then group by assignee_id "
+                "client-side. Use score='received' to limit to ratings customers "
+                "actually submitted, or 'good'/'bad' for a single sentiment. Filter "
+                "by date with start_time/end_time as Unix epoch seconds."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "string",
+                        "description": "Score filter: offered, unoffered, received, received_with_comment, received_without_comment, good, good_with_comment, good_without_comment, bad, bad_with_comment, bad_without_comment"
+                    },
+                    "start_time": {
+                        "type": "integer",
+                        "description": "Only ratings created at/after this Unix epoch (seconds)"
+                    },
+                    "end_time": {
+                        "type": "integer",
+                        "description": "Only ratings created at/before this Unix epoch (seconds)"
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Page number",
+                        "default": 1
+                    },
+                    "per_page": {
+                        "type": "integer",
+                        "description": "Results per page (max 100)",
+                        "default": 100
+                    }
+                },
+                "required": []
+            }
+        ),
+        types.Tool(
             name="update_ticket",
             description="Update fields on an existing Zendesk ticket (e.g., status, priority, assignee_id)",
             inputSchema={
@@ -510,6 +551,20 @@ async def handle_call_tool(
                 sort_order=arguments.get("sort_order"),
                 page=arguments.get("page", 1),
                 per_page=arguments.get("per_page", 25),
+            )
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(results, indent=2)
+            )]
+
+        elif name == "get_satisfaction_ratings":
+            args = arguments or {}
+            results = zendesk_client.get_satisfaction_ratings(
+                score=args.get("score"),
+                start_time=args.get("start_time"),
+                end_time=args.get("end_time"),
+                page=args.get("page", 1),
+                per_page=args.get("per_page", 100),
             )
             return [types.TextContent(
                 type="text",

@@ -499,6 +499,79 @@ class ZendeskClient:
         except Exception as e:
             raise Exception(f"Failed to search: {str(e)}")
 
+    def get_satisfaction_ratings(
+        self,
+        score: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        page: int = 1,
+        per_page: int = 100,
+    ) -> Dict[str, Any]:
+        """
+        List CSAT / satisfaction ratings via the Satisfaction Ratings API
+        (/api/v2/satisfaction_ratings.json).
+
+        The list endpoint has no server-side agent filter, so per-agent CSAT
+        analysis is done client-side off the `assignee_id` on each rating.
+        This method just surfaces the raw ratings (and their assignee_id,
+        score, comment, ticket_id, timestamps) plus pagination so the caller
+        can group/rank by agent and date range.
+
+        Args:
+            score: Optional score filter. Zendesk accepts: offered, unoffered,
+                received, received_with_comment, received_without_comment,
+                good, good_with_comment, good_without_comment, bad,
+                bad_with_comment, bad_without_comment.
+            start_time: Optional Unix epoch (seconds) — only ratings created
+                at/after this time.
+            end_time: Optional Unix epoch (seconds) — only ratings created
+                at/before this time.
+            page: Page number (1-based).
+            per_page: Results per page (max 100).
+
+        Returns:
+            Dict with `satisfaction_ratings` (list of raw rating objects),
+            `count`, and pagination info.
+        """
+        try:
+            per_page = min(per_page, 100)
+
+            params = {
+                'page': str(page),
+                'per_page': str(per_page),
+            }
+            if score:
+                params['score'] = score
+            if start_time is not None:
+                params['start_time'] = str(start_time)
+            if end_time is not None:
+                params['end_time'] = str(end_time)
+
+            query_string = urllib.parse.urlencode(params)
+            url = f"{self.base_url}/satisfaction_ratings.json?{query_string}"
+
+            req = urllib.request.Request(url)
+            req.add_header('Authorization', self.auth_header)
+            req.add_header('Content-Type', 'application/json')
+
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+
+            return {
+                'satisfaction_ratings': data.get('satisfaction_ratings', []),
+                'count': data.get('count', 0),
+                'page': page,
+                'per_page': per_page,
+                'has_more': data.get('next_page') is not None,
+                'next_page': page + 1 if data.get('next_page') else None,
+                'previous_page': page - 1 if data.get('previous_page') and page > 1 else None,
+            }
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode() if e.fp else "No response body"
+            raise Exception(f"Failed to get satisfaction ratings: HTTP {e.code} - {e.reason}. {error_body}")
+        except Exception as e:
+            raise Exception(f"Failed to get satisfaction ratings: {str(e)}")
+
     def get_all_articles(self) -> Dict[str, Any]:
         """
         Fetch help center articles as knowledge base.
