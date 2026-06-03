@@ -122,6 +122,19 @@ Full-text search across Zendesk via the Search API (`/api/v2/search.json`). Unli
 
 - Output: Returns matching results with pagination metadata (count, has_more, next_page, previous_page)
 
+### get_satisfaction_ratings
+
+List CSAT / satisfaction ratings via the Satisfaction Ratings API (`/api/v2/satisfaction_ratings.json`). Each rating includes `assignee_id`, `score` (good/bad), `comment`, `ticket_id`, and timestamps. There is no server-side agent filter — to rank CSAT per agent, fetch ratings (optionally filtered by score and date range) and group by `assignee_id` client-side.
+
+- Input:
+  - `score` (string, optional): Score filter - `offered`, `unoffered`, `received`, `received_with_comment`, `received_without_comment`, `good`, `good_with_comment`, `good_without_comment`, `bad`, `bad_with_comment`, `bad_without_comment`
+  - `start_time` (integer, optional): Only ratings created at/after this Unix epoch (seconds)
+  - `end_time` (integer, optional): Only ratings created at/before this Unix epoch (seconds)
+  - `page` (integer, optional): Page number (defaults to 1)
+  - `per_page` (integer, optional): Results per page, max 100 (defaults to 100)
+
+- Output: Returns `satisfaction_ratings` (raw rating objects) with pagination metadata (count, has_more, next_page, previous_page)
+
 ### list_views
 
 List all Zendesk views (filters/queues) with their ids and titles. Use this to resolve a view title to a numeric id.
