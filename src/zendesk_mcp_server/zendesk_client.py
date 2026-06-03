@@ -389,6 +389,78 @@ class ZendeskClient:
         except Exception as e:
             raise Exception(f"Failed to get latest tickets: {str(e)}")
 
+    def search(
+        self,
+        query: str,
+        type: str | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+        page: int = 1,
+        per_page: int = 25,
+    ) -> Dict[str, Any]:
+        """
+        Full-text search across Zendesk using the Search API
+        (/api/v2/search.json). Unlike views, this searches ticket bodies,
+        comments, subjects, tags, and more.
+
+        Args:
+            query: Zendesk search query string. Supports full-text terms and
+                field qualifiers, e.g. 'crash type:ticket status:open'.
+                See https://support.zendesk.com/hc/en-us/articles/4408886879258
+            type: Optional result type to restrict to (ticket, user,
+                organization, group). Prepended as 'type:<type>' if the query
+                does not already specify a type.
+            sort_by: Optional field to sort by (e.g. created_at, updated_at,
+                priority, status, ticket_type).
+            sort_order: Optional sort order (asc or desc).
+            page: Page number (1-based).
+            per_page: Results per page (max 100).
+
+        Returns:
+            Dict containing results and pagination info.
+        """
+        try:
+            per_page = min(per_page, 100)
+
+            full_query = query
+            if type and f"type:{type}" not in query:
+                full_query = f"type:{type} {query}".strip()
+
+            params = {
+                'query': full_query,
+                'page': str(page),
+                'per_page': str(per_page),
+            }
+            if sort_by:
+                params['sort_by'] = sort_by
+            if sort_order:
+                params['sort_order'] = sort_order
+
+            query_string = urllib.parse.urlencode(params)
+            url = f"{self.base_url}/search.json?{query_string}"
+
+            req = urllib.request.Request(url)
+            req.add_header('Authorization', self.auth_header)
+            req.add_header('Content-Type', 'application/json')
+
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+
+            return {
+                'results': data.get('results', []),
+                'count': data.get('count', 0),
+                'page': page,
+                'per_page': per_page,
+                'has_more': data.get('next_page') is not None,
+                'next_page': page + 1 if data.get('next_page') else None,
+                'previous_page': page - 1 if data.get('previous_page') and page > 1 else None,
+            }
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode() if e.fp else "No response body"
+            raise Exception(f"Failed to search: HTTP {e.code} - {e.reason}. {error_body}")
+        except Exception as e:
+            raise Exception(f"Failed to search: {str(e)}")
+
     def get_all_articles(self) -> Dict[str, Any]:
         """
         Fetch help center articles as knowledge base.

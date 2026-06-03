@@ -1,6 +1,6 @@
 # Zendesk MCP Server
 
-![ci](https://github.com/reminia/zendesk-mcp-server/actions/workflows/ci.yml/badge.svg)
+![ci](https://github.com/Ginger-Labs/zendesk-mcp-server/actions/workflows/ci.yml/badge.svg)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 A Model Context Protocol server for Zendesk.
@@ -108,6 +108,41 @@ Fetch the latest tickets with pagination support
 
 - Output: Returns a list of tickets with essential fields including id, subject, status, priority, description, timestamps, and assignee information, along with pagination metadata
 
+### search
+
+Full-text search across Zendesk via the Search API (`/api/v2/search.json`). Unlike views, this searches ticket **bodies**, comments, subjects, tags, and more — use it to find tickets by words in their description/body.
+
+- Input:
+  - `query` (string): Zendesk search query string. Supports full-text terms and field qualifiers, e.g. `crash status:open`, `type:ticket "login error"`, `requester:user@example.com`, `created>2024-01-01`. See [Zendesk search reference](https://support.zendesk.com/hc/en-us/articles/4408886879258).
+  - `type` (string, optional): Restrict results to one of `ticket`, `user`, `organization`, `group`
+  - `sort_by` (string, optional): Field to sort by - created_at, updated_at, priority, status, or ticket_type
+  - `sort_order` (string, optional): Sort order - asc or desc
+  - `page` (integer, optional): Page number (defaults to 1)
+  - `per_page` (integer, optional): Results per page, max 100 (defaults to 25)
+
+- Output: Returns matching results with pagination metadata (count, has_more, next_page, previous_page)
+
+### list_views
+
+List all Zendesk views (filters/queues) with their ids and titles. Use this to resolve a view title to a numeric id.
+
+- Input:
+  - `active_only` (boolean, optional): If true, return only active views (defaults to true)
+
+### get_view_tickets
+
+Return the tickets in a Zendesk view (filter/queue). The `view_id` is the numeric id from the view URL (e.g. `.../agent/filters/10045803779738` → `10045803779738`). Returns a summary list — call `get_ticket` for full detail.
+
+- Input:
+  - `view_id` (integer): Zendesk view id
+  - `limit` (integer, optional): Max tickets to return, 1-100 (defaults to 25)
+
+### list_ticket_fields
+
+List all ticket field definitions in the workspace, including custom fields. Use this to resolve custom field ids (from `get_ticket`'s `custom_fields`) to human-readable names.
+
+- Input: none
+
 ### get_ticket
 
 Retrieve a Zendesk ticket by its ID
@@ -121,6 +156,13 @@ Retrieve all comments for a Zendesk ticket by its ID
 
 - Input:
   - `ticket_id` (integer): The ID of the ticket to get comments for
+
+### get_ticket_attachment
+
+Fetch a ticket attachment by its `content_url` (from `get_ticket_comments`) and return it as base64-encoded data. Restricted to safe image types (jpeg, png, gif, webp) with magic-byte validation and a 10 MB size cap.
+
+- Input:
+  - `content_url` (string): The `content_url` of the attachment, as returned by `get_ticket_comments`
 
 ### create_ticket_comment
 
