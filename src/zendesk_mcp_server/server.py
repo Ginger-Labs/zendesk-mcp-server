@@ -386,6 +386,81 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="get_ticket_metrics",
+            description=(
+                "Fetch the metric set for a single ticket (Zendesk Ticket "
+                "Metrics API). Returns durations you can't get from views or "
+                "the ticket object: first reply time, first/full resolution "
+                "time, agent/requester wait time, and time spent in each "
+                "status — each reported in both calendar and business minutes. "
+                "Use this to compute KPIs like average first response time or "
+                "resolution time per agent."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket_id": {
+                        "type": "integer",
+                        "description": "The ID of the ticket to fetch metrics for"
+                    }
+                },
+                "required": ["ticket_id"]
+            }
+        ),
+        types.Tool(
+            name="get_users",
+            description=(
+                "Resolve a batch of Zendesk user ids to their profiles (name, "
+                "email, role, organization) in a single call. Tickets reference "
+                "people only by numeric id (requester_id, assignee_id), so use "
+                "this to turn those ids into human-readable names/emails — e.g. "
+                "to show who is waiting on a queue of tickets. Up to 100 ids "
+                "per call."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Zendesk user ids to resolve (max 100)"
+                    }
+                },
+                "required": ["user_ids"]
+            }
+        ),
+        types.Tool(
+            name="get_ticket_counts_by_status",
+            description=(
+                "Return per-status ticket counts in a single call, optionally "
+                "scoped to one agent, using the Zendesk Search Count API. "
+                "Instead of one view (or full ticket fetch) per status, this "
+                "fans out cheap count-only queries in parallel and returns a "
+                "{status: count} map plus a total. Defaults to the active "
+                "workload (new, open, pending, hold). Use 'hold' for the "
+                "on-hold status. Ideal for a lightweight per-agent workload "
+                "summary on a dashboard."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "assignee_id": {
+                        "type": "integer",
+                        "description": "Optional agent id to scope counts to. Omit for workspace-wide counts."
+                    },
+                    "statuses": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["new", "open", "pending", "hold", "solved", "closed"]
+                        },
+                        "description": "Statuses to count (new, open, pending, hold, solved, closed). Defaults to [new, open, pending, hold]."
+                    }
+                },
+                "required": []
+            }
+        ),
+        types.Tool(
             name="update_ticket",
             description="Update fields on an existing Zendesk ticket (e.g., status, priority, assignee_id)",
             inputSchema={
@@ -569,6 +644,35 @@ async def handle_call_tool(
             return [types.TextContent(
                 type="text",
                 text=json.dumps(results, indent=2)
+            )]
+
+        elif name == "get_ticket_metrics":
+            if not arguments or "ticket_id" not in arguments:
+                raise ValueError("Missing required argument: ticket_id")
+            metrics = zendesk_client.get_ticket_metrics(arguments["ticket_id"])
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(metrics, indent=2)
+            )]
+
+        elif name == "get_users":
+            if not arguments or "user_ids" not in arguments:
+                raise ValueError("Missing required argument: user_ids")
+            result = zendesk_client.get_users(arguments["user_ids"])
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(result, indent=2)
+            )]
+
+        elif name == "get_ticket_counts_by_status":
+            args = arguments or {}
+            result = zendesk_client.get_ticket_counts_by_status(
+                assignee_id=args.get("assignee_id"),
+                statuses=args.get("statuses"),
+            )
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(result, indent=2)
             )]
 
         elif name == "update_ticket":

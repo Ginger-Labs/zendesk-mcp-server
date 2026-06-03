@@ -135,6 +135,34 @@ List CSAT / satisfaction ratings via the Satisfaction Ratings API (`/api/v2/sati
 
 - Output: Returns `satisfaction_ratings` (raw rating objects) with pagination metadata (count, has_more, next_page, previous_page)
 
+### get_ticket_metrics
+
+Fetch the metric set for a single ticket via the Ticket Metrics API (`/api/v2/tickets/{id}/metrics.json`). Views and the ticket object expose status and timestamps but **not the durations** support teams report on — this returns them. Each duration is reported in both calendar and business (schedule) minutes, so you can compute KPIs like average first response time or resolution time per agent without deriving them yourself.
+
+- Input:
+  - `ticket_id` (integer): The ID of the ticket to fetch metrics for
+
+- Output: The raw `ticket_metric` object, including `reply_time_in_minutes`, `first_resolution_time_in_minutes`, `full_resolution_time_in_minutes`, agent/requester wait times, the `*_breaches` counters, and the per-status `*_at` timestamps
+
+### get_users
+
+Resolve a batch of user ids to their profiles in a single request via the Show Many Users API (`/api/v2/users/show_many.json`). Tickets reference people only by numeric id (`requester_id`, `assignee_id`), so use this to turn those ids into human-readable names and emails — for example, to display "who is waiting" across a queue of tickets — without one request per user.
+
+- Input:
+  - `user_ids` (array[integer]): Zendesk user ids to resolve (max 100 per call)
+
+- Output: `count` and `users`, a list of trimmed profiles (`id`, `name`, `email`, `role`, `active`, `organization_id`, `time_zone`, timestamps)
+
+### get_ticket_counts_by_status
+
+Return per-status ticket counts in a single call, optionally scoped to one agent, via the Search Count API (`/api/v2/search/count.json`). Instead of one view (or a full ticket fetch) per status, this fans out cheap count-only queries in parallel and returns a `{status: count}` map plus a total — ideal for a lightweight per-agent workload summary on a dashboard.
+
+- Input:
+  - `assignee_id` (integer, optional): Agent id to scope counts to. Omit for workspace-wide counts.
+  - `statuses` (array[string], optional): Statuses to count — `new`, `open`, `pending`, `hold`, `solved`, `closed`. Defaults to the active workload `[new, open, pending, hold]`. Use `hold` for the on-hold status.
+
+- Output: `assignee_id`, `counts` (status → `{count}`, or `{error}` if that status query failed — one bad query never sinks the rest), and `total` (sum across statuses that succeeded)
+
 ### list_views
 
 List all Zendesk views (filters/queues) with their ids and titles. Use this to resolve a view title to a numeric id.
