@@ -274,6 +274,26 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="get_views_batch",
+            description="Fetch tickets for multiple Zendesk views in a single call. Takes an array of view ids and fetches them in parallel (thread pool), returning one result per view in request order. Far faster than calling get_view_tickets sequentially for several views. A failing view returns {view_id, error} instead of sinking the batch.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "view_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Zendesk view ids to fetch tickets for"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max tickets to return per view (1-100)",
+                        "default": 25
+                    }
+                },
+                "required": ["view_ids"]
+            }
+        ),
+        types.Tool(
             name="list_ticket_fields",
             description="List all ticket field definitions in the Zendesk workspace, including custom fields. Use this to resolve custom_field ids (returned by get_ticket under custom_fields) to human-readable names like 'GitHub Issue #' or 'Fin Topic'.",
             inputSchema={
@@ -378,6 +398,18 @@ async def handle_call_tool(
                 raise ValueError("Missing arguments")
             result = zendesk_client.get_view_tickets(
                 view_id=arguments["view_id"],
+                limit=arguments.get("limit", 25),
+            )
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(result)
+            )]
+
+        elif name == "get_views_batch":
+            if not arguments or "view_ids" not in arguments:
+                raise ValueError("Missing required argument: view_ids")
+            result = zendesk_client.get_views_batch(
+                view_ids=arguments["view_ids"],
                 limit=arguments.get("limit", 25),
             )
             return [types.TextContent(

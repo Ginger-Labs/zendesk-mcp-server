@@ -1,4 +1,5 @@
 from typing import Dict, Any, List
+from concurrent.futures import ThreadPoolExecutor
 import json
 import urllib.request
 import urllib.parse
@@ -115,6 +116,43 @@ class ZendeskClient:
             }
         except Exception as e:
             raise Exception(f"Failed to get tickets for view {view_id}: {str(e)}")
+
+    def get_views_batch(self, view_ids: List[int], limit: int = 25) -> Dict[str, Any]:
+        """
+        Fetch tickets for several views in parallel.
+
+        zenpy's API client is blocking/synchronous, so each view fetch would
+        otherwise run serially. We fan the per-view calls out across a thread
+        pool (the Python equivalent of JS `Promise.all`) so the wall-clock cost
+        is roughly that of the slowest single view rather than their sum.
+
+        Args:
+            view_ids: List of Zendesk view ids to fetch.
+            limit: Max tickets to return per view. Capped at 100.
+
+        Returns:
+            Dict with `count` (number of views requested) and `views`, a list
+            of per-view results in the same order as `view_ids`. Each entry is
+            either the `get_view_tickets` payload or, if that view failed,
+            `{'view_id': id, 'error': <message>}` — one bad view never sinks
+            the rest of the batch.
+        """
+        if not view_ids:
+            return {'count': 0, 'views': []}
+
+        # Bound the pool so a huge id list can't spawn an unbounded thread count.
+        max_workers = min(len(view_ids), 10)
+
+        def fetch_one(view_id: int) -> Dict[str, Any]:
+            try:
+                return self.get_view_tickets(view_id=view_id, limit=limit)
+            except Exception as e:
+                return {'view_id': view_id, 'error': str(e)}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(fetch_one, view_ids))
+
+        return {'count': len(results), 'views': results}
 
     def list_views(self, active_only: bool = True) -> List[Dict[str, Any]]:
         """
