@@ -572,6 +572,159 @@ class ZendeskClient:
         except Exception as e:
             raise Exception(f"Failed to get satisfaction ratings: {str(e)}")
 
+    def get_ticket_metrics(self, ticket_id: int) -> Dict[str, Any]:
+        """
+        Fetch the metric set for a single ticket via the Ticket Metrics API
+        (/api/v2/tickets/{id}/metrics.json).
+
+        Views and the ticket object itself expose status and timestamps, but
+        not the *durations* support teams actually report on: how long until
+        the first agent reply, how long until full resolution, and how long the
+        ticket sat in each state. Those live only on the metric set. Surfacing
+        them lets a dashboard compute KPIs like average first reply time or
+        resolution time per agent — numbers you cannot derive from views alone.
+
+        Zendesk reports each duration twice: in calendar minutes and in
+        business (schedule) minutes. Both are passed through untouched.
+
+        Args:
+            ticket_id: The ticket whose metrics to fetch.
+
+        Returns:
+            The raw `ticket_metric` object, including reply_time_in_minutes,
+            first_resolution_time_in_minutes, full_resolution_time_in_minutes,
+            and the various *_breaches / *_at fields, plus created/updated
+            timestamps.
+        """
+        try:
+            url = f"{self.base_url}/tickets/{ticket_id}/metrics.json"
+
+            req = urllib.request.Request(url)
+            req.add_header('Authorization', self.auth_header)
+            req.add_header('Content-Type', 'application/json')
+
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+
+            return data.get('ticket_metric', data)
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode() if e.fp else "No response body"
+            raise Exception(f"Failed to get metrics for ticket {ticket_id}: HTTP {e.code} - {e.reason}. {error_body}")
+        except Exception as e:
+            raise Exception(f"Failed to get metrics for ticket {ticket_id}: {str(e)}")
+
+    def get_users(self, user_ids: List[int]) -> Dict[str, Any]:
+        """
+        Resolve one or more user ids to their profiles via the Show Many Users
+        API (/api/v2/users/show_many.json?ids=...).
+
+        Tickets reference people only by numeric id (requester_id,
+        assignee_id), so raw ticket data can't answer "who is waiting" or
+        "which agent owns this" without a name/email lookup. This resolves a
+        batch of ids in a single round trip rather than one request per user.
+
+        Args:
+            user_ids: List of Zendesk user ids to resolve (max 100 per call —
+                the Show Many endpoint's hard limit).
+
+        Returns:
+            Dict with `count` and `users`, a list of trimmed profiles
+            (id, name, email, role, active, organization_id, time_zone,
+            created_at, updated_at) in Zendesk's returned order.
+        """
+        try:
+            if not user_ids:
+                return {'count': 0, 'users': []}
+
+            # Show Many caps at 100 ids per request.
+            ids = user_ids[:100]
+            ids_param = ','.join(str(uid) for uid in ids)
+            url = f"{self.base_url}/users/show_many.json?ids={ids_param}"
+
+            req = urllib.request.Request(url)
+            req.add_header('Authorization', self.auth_header)
+            req.add_header('Content-Type', 'application/json')
+
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+
+            users = [{
+                'id': u.get('id'),
+                'name': u.get('name'),
+                'email': u.get('email'),
+                'role': u.get('role'),
+                'active': u.get('active'),
+                'organization_id': u.get('organization_id'),
+                'time_zone': u.get('time_zone'),
+                'created_at': u.get('created_at'),
+                'updated_at': u.get('updated_at'),
+            } for u in data.get('users', [])]
+
+            return {'count': len(users), 'users': users}
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode() if e.fp else "No response body"
+            raise Exception(f"Failed to get users {user_ids}: HTTP {e.code} - {e.reason}. {error_body}")
+        except Exception as e:
+            raise Exception(f"Failed to get users {user_ids}: {str(e)}")
+
+    def get_ticket_counts_by_status(
+        self,
+        assignee_id: int | None = None,
+        statuses: List[str] | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Return per-status ticket counts in one call, optionally scoped to a
+        single agent, via the Search Count API (/api/v2/search/count.json).
+
+        A dashboard that wants "open + pending + on-hold for this agent"
+        otherwise needs a separate view (or full ticket fetch) per status. The
+        Search Count endpoint returns just an integer per query, so we fan the
+        per-status queries out across a thread pool and assemble one map. This
+        is far cheaper than pulling ticket bodies only to count them.
+
+        Args:
+            assignee_id: Optional agent id to scope the counts to. Omit for a
+                workspace-wide count.
+            statuses: Optional list of statuses to count. Defaults to the
+                active workload (new, open, pending, hold). Zendesk's "on-hold"
+                status is queried as `hold`.
+
+        Returns:
+            Dict with `assignee_id`, `counts` (status -> integer), and `total`
+            (sum across the requested statuses).
+        """
+        try:
+            statuses = statuses or ['new', 'open', 'pending', 'hold']
+
+            def count_one(status: str) -> int:
+                query = f"type:ticket status:{status}"
+                if assignee_id is not None:
+                    query += f" assignee:{assignee_id}"
+                params = urllib.parse.urlencode({'query': query})
+                url = f"{self.base_url}/search/count.json?{params}"
+                req = urllib.request.Request(url)
+                req.add_header('Authorization', self.auth_header)
+                req.add_header('Content-Type', 'application/json')
+                with urllib.request.urlopen(req) as response:
+                    data = json.loads(response.read().decode())
+                return int(data.get('count', 0))
+
+            max_workers = min(len(statuses), 10)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                results = list(executor.map(count_one, statuses))
+
+            counts = dict(zip(statuses, results))
+            return {
+                'assignee_id': assignee_id,
+                'counts': counts,
+                'total': sum(results),
+            }
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode() if e.fp else "No response body"
+            raise Exception(f"Failed to get ticket counts: HTTP {e.code} - {e.reason}. {error_body}")
+        except Exception as e:
+            raise Exception(f"Failed to get ticket counts: {str(e)}")
+
     def get_all_articles(self) -> Dict[str, Any]:
         """
         Fetch help center articles as knowledge base.
