@@ -283,6 +283,48 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="search",
+            description=(
+                "Full-text search across Zendesk via the Search API. Unlike views, "
+                "this searches ticket bodies, comments, subjects, tags, and more. "
+                "Use this to find tickets by words in their body/description. "
+                "Supports Zendesk query syntax (e.g. 'crash status:open', "
+                "'type:ticket \"login error\"', 'requester:user@example.com')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Zendesk search query string. Supports full-text terms and field qualifiers (status, priority, requester, created>2024-01-01, etc.)."
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "Restrict results to a type: ticket, user, organization, or group"
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": "Field to sort by (created_at, updated_at, priority, status, ticket_type)"
+                    },
+                    "sort_order": {
+                        "type": "string",
+                        "description": "Sort order (asc or desc)"
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Page number",
+                        "default": 1
+                    },
+                    "per_page": {
+                        "type": "integer",
+                        "description": "Results per page (max 100)",
+                        "default": 25
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
+        types.Tool(
             name="update_ticket",
             description="Update fields on an existing Zendesk ticket (e.g., status, priority, assignee_id)",
             inputSchema={
@@ -425,6 +467,22 @@ async def handle_call_tool(
                     type="text",
                     text=json.dumps({"content_type": content_type, "data_base64": result["data"]})
                 )]
+
+        elif name == "search":
+            if not arguments or not arguments.get("query"):
+                raise ValueError("Missing required argument: query")
+            results = zendesk_client.search(
+                query=arguments["query"],
+                type=arguments.get("type"),
+                sort_by=arguments.get("sort_by"),
+                sort_order=arguments.get("sort_order"),
+                page=arguments.get("page", 1),
+                per_page=arguments.get("per_page", 25),
+            )
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(results, indent=2)
+            )]
 
         elif name == "update_ticket":
             if not arguments:
