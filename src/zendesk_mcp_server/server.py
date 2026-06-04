@@ -1,7 +1,11 @@
 import asyncio
+import base64
 import json
 import logging
 import os
+import secrets
+import tempfile
+from pathlib import Path
 from typing import Any, Dict
 
 from cachetools.func import ttl_cache
@@ -126,6 +130,44 @@ async def handle_get_prompt(name: str, arguments: Dict[str, str] | None) -> type
 async def handle_list_tools() -> list[types.Tool]:
     """List available Zendesk tools"""
     return [
+        types.Tool(
+            name="fetch_result_chunk",
+            description=(
+                "Retrieve the next slice of a previously truncated tool result. "
+                "When any tool's result exceeds the 1 MB MCP cap, it is spilled to "
+                "a temp file and the caller gets an envelope with `truncated: true`, "
+                "a `result_token`, a `saved_to` path, and a `next_offset`. Call this "
+                "with that `result_token` (or `saved_to` as `path`) and `offset` set "
+                "to `next_offset` to read the next chunk; repeat until `next_offset` "
+                "is null. Each chunk's `data_base64` is base64 of the raw byte slice "
+                "— base64-decode and concatenate the bytes across chunks to rebuild "
+                "the full payload."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "result_token": {
+                        "type": "string",
+                        "description": "The result_token from a truncated result envelope."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Alternatively, the saved_to path from the envelope."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Byte offset to start reading from (use next_offset). Default 0.",
+                        "default": 0
+                    },
+                    "length": {
+                        "type": "integer",
+                        "description": "Bytes to read this call (capped at 600000).",
+                        "default": 600000
+                    }
+                },
+                "required": []
+            }
+        ),
         types.Tool(
             name="get_ticket",
             description="Retrieve a Zendesk ticket by its ID",
@@ -483,6 +525,146 @@ async def handle_list_tools() -> list[types.Tool]:
     ]
 
 
+# --- Oversized-result guard -------------------------------------------------
+#
+# MCP hosts reject any single tool result over 1 MB ("Tool result is too large.
+# Maximum size is 1MB"). Several tools here can blow past that (attachment
+# base64, long comment threads, wide search pages). Rather than fix each tool,
+# every result passes through _guard_result: if it fits, it goes through
+# untouched; if not, the full payload is spilled to a temp file and the caller
+# gets a small envelope (preview + token + path + next_offset). The full data is
+# then retrievable two ways: read the file directly (saved_to), or page through
+# it byte-for-byte with the fetch_result_chunk tool (host-agnostic, no
+# filesystem access required).
+
+# Stay under the 1 MB hard cap with headroom for the JSON-RPC envelope.
+MAX_RESULT_BYTES = 900_000
+# How much of an oversized text payload to inline as a human/LLM-readable preview.
+PREVIEW_BYTES = 16_000
+# Default chunk size for fetch_result_chunk. Base64 inflates ~33%, so a 600 KB
+# raw slice serializes to ~800 KB — comfortably under the cap.
+CHUNK_BYTES = 600_000
+
+
+def _spill_dir() -> Path:
+    """Directory holding spilled oversized results. Override with ZENDESK_MCP_SPILL_DIR."""
+    override = os.getenv("ZENDESK_MCP_SPILL_DIR")
+    base = Path(override) if override else Path(tempfile.gettempdir()) / "zendesk-mcp-results"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _content_bytes(item: Any) -> int:
+    if isinstance(item, types.TextContent):
+        return len(item.text.encode("utf-8"))
+    if isinstance(item, types.ImageContent):
+        return len(item.data.encode("ascii"))
+    return 0
+
+
+def _spill_envelope(token: str, path: Path, total: int, *, preview: str | None,
+                    mime_type: str | None = None) -> types.TextContent:
+    envelope: Dict[str, Any] = {
+        "truncated": True,
+        "reason": f"Full result is {total} bytes, over the {MAX_RESULT_BYTES}-byte MCP cap.",
+        "total_bytes": total,
+        "result_token": token,
+        "saved_to": str(path),
+        "how_to_get_full": (
+            "Read the file at saved_to directly, OR call fetch_result_chunk with "
+            "this result_token (or saved_to as 'path') starting at next_offset, "
+            "repeating until next_offset is null. Chunk data is base64 of the raw "
+            "byte slice — concatenate the decoded bytes to reconstruct the payload."
+        ),
+    }
+    if preview is not None:
+        envelope["preview"] = preview
+        envelope["preview_bytes"] = len(preview.encode("utf-8"))
+        envelope["next_offset"] = min(PREVIEW_BYTES, total)
+    else:
+        envelope["next_offset"] = 0
+    if mime_type is not None:
+        envelope["mime_type"] = mime_type
+    return types.TextContent(type="text", text=json.dumps(envelope, indent=2))
+
+
+def _guard_result(contents: list[Any]) -> list[Any]:
+    """Pass results through untouched if they fit; otherwise spill + return an envelope."""
+    total = sum(_content_bytes(item) for item in contents)
+    if total <= MAX_RESULT_BYTES:
+        return contents
+
+    token = secrets.token_hex(8)
+    text_items = [i for i in contents if isinstance(i, types.TextContent)]
+    image_items = [i for i in contents if isinstance(i, types.ImageContent)]
+
+    # Image / binary payload: spill the decoded bytes, no text preview.
+    if image_items and not text_items:
+        img = image_items[0]
+        raw = base64.b64decode(img.data)
+        ext = (img.mimeType.split("/")[-1] if img.mimeType else "bin") or "bin"
+        path = _spill_dir() / f"{token}.{ext}"
+        path.write_bytes(raw)
+        return [_spill_envelope(token, path, len(raw), preview=None, mime_type=img.mimeType)]
+
+    # Text payload (every JSON tool): spill UTF-8, inline a head preview.
+    full = text_items[0].text if len(text_items) == 1 else json.dumps([t.text for t in text_items])
+    data = full.encode("utf-8")
+    path = _spill_dir() / f"{token}.json"
+    path.write_bytes(data)
+    preview = data[:PREVIEW_BYTES].decode("utf-8", errors="replace")
+    return [_spill_envelope(token, path, len(data), preview=preview)]
+
+
+def _resolve_spill_path(arguments: dict[str, Any]) -> Path:
+    """Resolve a fetch_result_chunk target to a path inside the spill dir (no traversal)."""
+    spill = _spill_dir().resolve()
+    raw_path = arguments.get("path")
+    token = arguments.get("result_token")
+    if raw_path:
+        candidate = Path(raw_path).resolve()
+    elif token:
+        matches = list(spill.glob(f"{token}.*"))
+        if not matches:
+            raise ValueError(f"No spilled result found for token '{token}' (it may have been cleaned up).")
+        candidate = matches[0].resolve()
+    else:
+        raise ValueError("fetch_result_chunk requires 'result_token' or 'path'.")
+
+    if spill not in candidate.parents:
+        raise ValueError("Refusing to read a path outside the spill directory.")
+    if not candidate.is_file():
+        raise ValueError(f"Spilled result file not found: {candidate}")
+    return candidate
+
+
+def _fetch_result_chunk(arguments: dict[str, Any]) -> Dict[str, Any]:
+    path = _resolve_spill_path(arguments)
+    offset = int(arguments.get("offset", 0))
+    length = int(arguments.get("length", CHUNK_BYTES))
+    length = max(1, min(length, CHUNK_BYTES))
+    total = path.stat().st_size
+    if offset < 0 or offset > total:
+        raise ValueError(f"offset {offset} out of range for {total}-byte result.")
+
+    with path.open("rb") as fh:
+        fh.seek(offset)
+        chunk = fh.read(length)
+    next_offset = offset + len(chunk)
+    eof = next_offset >= total
+    return {
+        "result_token": arguments.get("result_token"),
+        "path": str(path),
+        "offset": offset,
+        "length": len(chunk),
+        "total_bytes": total,
+        "next_offset": None if eof else next_offset,
+        "eof": eof,
+        "encoding": "base64",
+        "data_base64": base64.b64encode(chunk).decode("ascii"),
+    }
+
+
 @server.call_tool()
 async def handle_call_tool(
         name: str,
@@ -490,7 +672,27 @@ async def handle_call_tool(
 ) -> list[types.TextContent]:
     """Handle Zendesk tool execution requests"""
     try:
-        if name == "get_ticket":
+        return _guard_result(_dispatch_tool(name, arguments))
+    except Exception as e:
+        return [types.TextContent(
+            type="text",
+            text=f"Error: {str(e)}"
+        )]
+
+
+def _dispatch_tool(
+        name: str,
+        arguments: dict[str, Any] | None
+) -> list[Any]:
+    """Route a tool call to its handler and return raw content (pre-guard)."""
+    if True:
+        if name == "fetch_result_chunk":
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(_fetch_result_chunk(arguments or {}), indent=2)
+            )]
+
+        elif name == "get_ticket":
             if not arguments:
                 raise ValueError("Missing arguments")
             ticket = zendesk_client.get_ticket(arguments["ticket_id"])
@@ -690,12 +892,6 @@ async def handle_call_tool(
 
         else:
             raise ValueError(f"Unknown tool: {name}")
-
-    except Exception as e:
-        return [types.TextContent(
-            type="text",
-            text=f"Error: {str(e)}"
-        )]
 
 
 @server.list_resources()
