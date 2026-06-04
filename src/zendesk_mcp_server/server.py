@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -544,6 +545,10 @@ PREVIEW_BYTES = 16_000
 # Default chunk size for fetch_result_chunk. Base64 inflates ~33%, so a 600 KB
 # raw slice serializes to ~800 KB — comfortably under the cap.
 CHUNK_BYTES = 600_000
+# Spilled files are bounded by age, not count: anything older than this is swept
+# on the next spill. Generous enough that a caller paging a fresh result with
+# fetch_result_chunk will never see it disappear mid-read.
+SPILL_TTL_SECONDS = 24 * 60 * 60
 
 
 def _spill_dir() -> Path:
@@ -552,6 +557,21 @@ def _spill_dir() -> Path:
     base = Path(override) if override else Path(tempfile.gettempdir()) / "zendesk-mcp-results"
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+def _sweep_old_spills(base: Path) -> None:
+    """Best-effort delete of spill files older than SPILL_TTL_SECONDS. Never raises."""
+    cutoff = time.time() - SPILL_TTL_SECONDS
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                entry.unlink()
+        except OSError:
+            continue
 
 
 def _content_bytes(item: Any) -> int:
@@ -570,19 +590,21 @@ def _spill_envelope(token: str, path: Path, total: int, *, preview: str | None,
         "total_bytes": total,
         "result_token": token,
         "saved_to": str(path),
+        # The chunk stream always starts at byte 0 — preview is a display
+        # convenience, NOT part of the reconstructable byte stream.
+        "next_offset": 0,
         "how_to_get_full": (
             "Read the file at saved_to directly, OR call fetch_result_chunk with "
-            "this result_token (or saved_to as 'path') starting at next_offset, "
+            "this result_token (or saved_to as 'path') starting at next_offset (0), "
             "repeating until next_offset is null. Chunk data is base64 of the raw "
-            "byte slice — concatenate the decoded bytes to reconstruct the payload."
+            "byte slice — concatenate the decoded bytes to reconstruct the payload. "
+            "The preview is a lossy head excerpt for display only; do not use it to "
+            "rebuild the payload."
         ),
     }
     if preview is not None:
         envelope["preview"] = preview
         envelope["preview_bytes"] = len(preview.encode("utf-8"))
-        envelope["next_offset"] = min(PREVIEW_BYTES, total)
-    else:
-        envelope["next_offset"] = 0
     if mime_type is not None:
         envelope["mime_type"] = mime_type
     return types.TextContent(type="text", text=json.dumps(envelope, indent=2))
@@ -594,25 +616,27 @@ def _guard_result(contents: list[Any]) -> list[Any]:
     if total <= MAX_RESULT_BYTES:
         return contents
 
+    # Every tool handler returns exactly one content item (one TextContent or
+    # one ImageContent); spilling only ever deals with that single payload.
+    item = contents[0]
     token = secrets.token_hex(8)
-    text_items = [i for i in contents if isinstance(i, types.TextContent)]
-    image_items = [i for i in contents if isinstance(i, types.ImageContent)]
+    _sweep_old_spills(_spill_dir())
 
     # Image / binary payload: spill the decoded bytes, no text preview.
-    if image_items and not text_items:
-        img = image_items[0]
-        raw = base64.b64decode(img.data)
-        ext = (img.mimeType.split("/")[-1] if img.mimeType else "bin") or "bin"
+    if isinstance(item, types.ImageContent):
+        raw = base64.b64decode(item.data)
+        ext = (item.mimeType.split("/")[-1] if item.mimeType else "bin") or "bin"
         path = _spill_dir() / f"{token}.{ext}"
         path.write_bytes(raw)
-        return [_spill_envelope(token, path, len(raw), preview=None, mime_type=img.mimeType)]
+        return [_spill_envelope(token, path, len(raw), preview=None, mime_type=item.mimeType)]
 
     # Text payload (every JSON tool): spill UTF-8, inline a head preview.
-    full = text_items[0].text if len(text_items) == 1 else json.dumps([t.text for t in text_items])
-    data = full.encode("utf-8")
+    data = item.text.encode("utf-8")
     path = _spill_dir() / f"{token}.json"
     path.write_bytes(data)
-    preview = data[:PREVIEW_BYTES].decode("utf-8", errors="replace")
+    # Slice the decoded string, not the bytes, so the preview can't end on a
+    # split multibyte sequence.
+    preview = item.text[:PREVIEW_BYTES]
     return [_spill_envelope(token, path, len(data), preview=preview)]
 
 
@@ -685,213 +709,212 @@ def _dispatch_tool(
         arguments: dict[str, Any] | None
 ) -> list[Any]:
     """Route a tool call to its handler and return raw content (pre-guard)."""
-    if True:
-        if name == "fetch_result_chunk":
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(_fetch_result_chunk(arguments or {}), indent=2)
+    if name == "fetch_result_chunk":
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(_fetch_result_chunk(arguments or {}), indent=2)
+        )]
+
+    elif name == "get_ticket":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        ticket = zendesk_client.get_ticket(arguments["ticket_id"])
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(ticket)
+        )]
+
+    elif name == "list_views":
+        active_only = True
+        if arguments and "active_only" in arguments:
+            active_only = bool(arguments["active_only"])
+        views = zendesk_client.list_views(active_only=active_only)
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(views)
+        )]
+
+    elif name == "get_view_tickets":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        result = zendesk_client.get_view_tickets(
+            view_id=arguments["view_id"],
+            limit=arguments.get("limit", 25),
+        )
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(result)
+        )]
+
+    elif name == "get_views_batch":
+        if not arguments or "view_ids" not in arguments:
+            raise ValueError("Missing required argument: view_ids")
+        result = zendesk_client.get_views_batch(
+            view_ids=arguments["view_ids"],
+            limit=arguments.get("limit", 25),
+        )
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(result)
+        )]
+
+    elif name == "list_ticket_fields":
+        fields = zendesk_client.list_ticket_fields()
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(fields)
+        )]
+
+    elif name == "create_ticket":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        created = zendesk_client.create_ticket(
+            subject=arguments.get("subject"),
+            description=arguments.get("description"),
+            requester_id=arguments.get("requester_id"),
+            assignee_id=arguments.get("assignee_id"),
+            priority=arguments.get("priority"),
+            type=arguments.get("type"),
+            tags=arguments.get("tags"),
+            custom_fields=arguments.get("custom_fields"),
+        )
+        return [types.TextContent(
+            type="text",
+            text=json.dumps({"message": "Ticket created successfully", "ticket": created}, indent=2)
+        )]
+
+    elif name == "get_tickets":
+        page = arguments.get("page", 1) if arguments else 1
+        per_page = arguments.get("per_page", 25) if arguments else 25
+        sort_by = arguments.get("sort_by", "created_at") if arguments else "created_at"
+        sort_order = arguments.get("sort_order", "desc") if arguments else "desc"
+
+        tickets = zendesk_client.get_tickets(
+            page=page,
+            per_page=per_page,
+            sort_by=sort_by,
+            sort_order=sort_order
+        )
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(tickets, indent=2)
+        )]
+
+    elif name == "get_ticket_comments":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        comments = zendesk_client.get_ticket_comments(
+            arguments["ticket_id"])
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(comments)
+        )]
+
+    elif name == "create_ticket_comment":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        public = arguments.get("public", True)
+        result = zendesk_client.post_comment(
+            ticket_id=arguments["ticket_id"],
+            comment=arguments["comment"],
+            public=public
+        )
+        return [types.TextContent(
+            type="text",
+            text=f"Comment created successfully: {result}"
+        )]
+
+    elif name == "get_ticket_attachment":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        result = zendesk_client.get_ticket_attachment(arguments["content_url"])
+        content_type = result["content_type"]
+        if content_type.startswith("image/"):
+            return [types.ImageContent(
+                type="image",
+                data=result["data"],
+                mimeType=content_type,
             )]
-
-        elif name == "get_ticket":
-            if not arguments:
-                raise ValueError("Missing arguments")
-            ticket = zendesk_client.get_ticket(arguments["ticket_id"])
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(ticket)
-            )]
-
-        elif name == "list_views":
-            active_only = True
-            if arguments and "active_only" in arguments:
-                active_only = bool(arguments["active_only"])
-            views = zendesk_client.list_views(active_only=active_only)
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(views)
-            )]
-
-        elif name == "get_view_tickets":
-            if not arguments:
-                raise ValueError("Missing arguments")
-            result = zendesk_client.get_view_tickets(
-                view_id=arguments["view_id"],
-                limit=arguments.get("limit", 25),
-            )
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(result)
-            )]
-
-        elif name == "get_views_batch":
-            if not arguments or "view_ids" not in arguments:
-                raise ValueError("Missing required argument: view_ids")
-            result = zendesk_client.get_views_batch(
-                view_ids=arguments["view_ids"],
-                limit=arguments.get("limit", 25),
-            )
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(result)
-            )]
-
-        elif name == "list_ticket_fields":
-            fields = zendesk_client.list_ticket_fields()
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(fields)
-            )]
-
-        elif name == "create_ticket":
-            if not arguments:
-                raise ValueError("Missing arguments")
-            created = zendesk_client.create_ticket(
-                subject=arguments.get("subject"),
-                description=arguments.get("description"),
-                requester_id=arguments.get("requester_id"),
-                assignee_id=arguments.get("assignee_id"),
-                priority=arguments.get("priority"),
-                type=arguments.get("type"),
-                tags=arguments.get("tags"),
-                custom_fields=arguments.get("custom_fields"),
-            )
-            return [types.TextContent(
-                type="text",
-                text=json.dumps({"message": "Ticket created successfully", "ticket": created}, indent=2)
-            )]
-
-        elif name == "get_tickets":
-            page = arguments.get("page", 1) if arguments else 1
-            per_page = arguments.get("per_page", 25) if arguments else 25
-            sort_by = arguments.get("sort_by", "created_at") if arguments else "created_at"
-            sort_order = arguments.get("sort_order", "desc") if arguments else "desc"
-
-            tickets = zendesk_client.get_tickets(
-                page=page,
-                per_page=per_page,
-                sort_by=sort_by,
-                sort_order=sort_order
-            )
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(tickets, indent=2)
-            )]
-
-        elif name == "get_ticket_comments":
-            if not arguments:
-                raise ValueError("Missing arguments")
-            comments = zendesk_client.get_ticket_comments(
-                arguments["ticket_id"])
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(comments)
-            )]
-
-        elif name == "create_ticket_comment":
-            if not arguments:
-                raise ValueError("Missing arguments")
-            public = arguments.get("public", True)
-            result = zendesk_client.post_comment(
-                ticket_id=arguments["ticket_id"],
-                comment=arguments["comment"],
-                public=public
-            )
-            return [types.TextContent(
-                type="text",
-                text=f"Comment created successfully: {result}"
-            )]
-
-        elif name == "get_ticket_attachment":
-            if not arguments:
-                raise ValueError("Missing arguments")
-            result = zendesk_client.get_ticket_attachment(arguments["content_url"])
-            content_type = result["content_type"]
-            if content_type.startswith("image/"):
-                return [types.ImageContent(
-                    type="image",
-                    data=result["data"],
-                    mimeType=content_type,
-                )]
-            else:
-                return [types.TextContent(
-                    type="text",
-                    text=json.dumps({"content_type": content_type, "data_base64": result["data"]})
-                )]
-
-        elif name == "search":
-            if not arguments or not arguments.get("query"):
-                raise ValueError("Missing required argument: query")
-            results = zendesk_client.search(
-                query=arguments["query"],
-                type=arguments.get("type"),
-                sort_by=arguments.get("sort_by"),
-                sort_order=arguments.get("sort_order"),
-                page=arguments.get("page", 1),
-                per_page=arguments.get("per_page", 25),
-            )
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(results, indent=2)
-            )]
-
-        elif name == "get_satisfaction_ratings":
-            args = arguments or {}
-            results = zendesk_client.get_satisfaction_ratings(
-                score=args.get("score"),
-                start_time=args.get("start_time"),
-                end_time=args.get("end_time"),
-                page=args.get("page", 1),
-                per_page=args.get("per_page", 100),
-            )
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(results, indent=2)
-            )]
-
-        elif name == "get_ticket_metrics":
-            if not arguments or "ticket_id" not in arguments:
-                raise ValueError("Missing required argument: ticket_id")
-            metrics = zendesk_client.get_ticket_metrics(arguments["ticket_id"])
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(metrics, indent=2)
-            )]
-
-        elif name == "get_users":
-            if not arguments or "user_ids" not in arguments:
-                raise ValueError("Missing required argument: user_ids")
-            result = zendesk_client.get_users(arguments["user_ids"])
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(result, indent=2)
-            )]
-
-        elif name == "get_ticket_counts_by_status":
-            args = arguments or {}
-            result = zendesk_client.get_ticket_counts_by_status(
-                assignee_id=args.get("assignee_id"),
-                statuses=args.get("statuses"),
-            )
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(result, indent=2)
-            )]
-
-        elif name == "update_ticket":
-            if not arguments:
-                raise ValueError("Missing arguments")
-            ticket_id = arguments.get("ticket_id")
-            if ticket_id is None:
-                raise ValueError("ticket_id is required")
-            update_fields = {k: v for k, v in arguments.items() if k != "ticket_id"}
-            updated = zendesk_client.update_ticket(ticket_id=int(ticket_id), **update_fields)
-            return [types.TextContent(
-                type="text",
-                text=json.dumps({"message": "Ticket updated successfully", "ticket": updated}, indent=2)
-            )]
-
         else:
-            raise ValueError(f"Unknown tool: {name}")
+            return [types.TextContent(
+                type="text",
+                text=json.dumps({"content_type": content_type, "data_base64": result["data"]})
+            )]
+
+    elif name == "search":
+        if not arguments or not arguments.get("query"):
+            raise ValueError("Missing required argument: query")
+        results = zendesk_client.search(
+            query=arguments["query"],
+            type=arguments.get("type"),
+            sort_by=arguments.get("sort_by"),
+            sort_order=arguments.get("sort_order"),
+            page=arguments.get("page", 1),
+            per_page=arguments.get("per_page", 25),
+        )
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(results, indent=2)
+        )]
+
+    elif name == "get_satisfaction_ratings":
+        args = arguments or {}
+        results = zendesk_client.get_satisfaction_ratings(
+            score=args.get("score"),
+            start_time=args.get("start_time"),
+            end_time=args.get("end_time"),
+            page=args.get("page", 1),
+            per_page=args.get("per_page", 100),
+        )
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(results, indent=2)
+        )]
+
+    elif name == "get_ticket_metrics":
+        if not arguments or "ticket_id" not in arguments:
+            raise ValueError("Missing required argument: ticket_id")
+        metrics = zendesk_client.get_ticket_metrics(arguments["ticket_id"])
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(metrics, indent=2)
+        )]
+
+    elif name == "get_users":
+        if not arguments or "user_ids" not in arguments:
+            raise ValueError("Missing required argument: user_ids")
+        result = zendesk_client.get_users(arguments["user_ids"])
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(result, indent=2)
+        )]
+
+    elif name == "get_ticket_counts_by_status":
+        args = arguments or {}
+        result = zendesk_client.get_ticket_counts_by_status(
+            assignee_id=args.get("assignee_id"),
+            statuses=args.get("statuses"),
+        )
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(result, indent=2)
+        )]
+
+    elif name == "update_ticket":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        ticket_id = arguments.get("ticket_id")
+        if ticket_id is None:
+            raise ValueError("ticket_id is required")
+        update_fields = {k: v for k, v in arguments.items() if k != "ticket_id"}
+        updated = zendesk_client.update_ticket(ticket_id=int(ticket_id), **update_fields)
+        return [types.TextContent(
+            type="text",
+            text=json.dumps({"message": "Ticket updated successfully", "ticket": updated}, indent=2)
+        )]
+
+    else:
+        raise ValueError(f"Unknown tool: {name}")
 
 
 @server.list_resources()
