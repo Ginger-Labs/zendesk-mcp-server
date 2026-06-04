@@ -204,6 +204,11 @@ class ZendeskClient:
     def get_ticket_comments(self, ticket_id: int) -> List[Dict[str, Any]]:
         """
         Get all comments for a specific ticket, including attachment metadata.
+
+        Only the plain-text `body` is returned. `html_body` is intentionally
+        omitted: it carries the same content wrapped in markup, so it roughly
+        doubles the payload (and long threads are a common cause of the 1 MB
+        result cap) without adding information an agent needs.
         """
         try:
             comments = self.client.tickets.comments(ticket=ticket_id)
@@ -222,7 +227,6 @@ class ZendeskClient:
                     'id': comment.id,
                     'author_id': comment.author_id,
                     'body': comment.body,
-                    'html_body': comment.html_body,
                     'public': comment.public,
                     'created_at': str(comment.created_at),
                     'attachments': attachments,
@@ -484,8 +488,9 @@ class ZendeskClient:
             with urllib.request.urlopen(req) as response:
                 data = json.loads(response.read().decode())
 
+            results = [self._trim_search_result(r) for r in data.get('results', [])]
             return {
-                'results': data.get('results', []),
+                'results': results,
                 'count': data.get('count', 0),
                 'page': page,
                 'per_page': per_page,
@@ -498,6 +503,53 @@ class ZendeskClient:
             raise Exception(f"Failed to search: HTTP {e.code} - {e.reason}. {error_body}")
         except Exception as e:
             raise Exception(f"Failed to search: {str(e)}")
+
+    @staticmethod
+    def _trim_search_result(r: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Trim a raw Search API result to a summary.
+
+        Search returns full objects, and a ticket carries its entire
+        `description` (plus a wide custom_fields/fields block) — at per_page=100
+        that easily blows the 1 MB result cap. We keep the fields needed to
+        identify and triage a result and drop the bulky body; callers fetch full
+        detail via get_ticket / get_users when they need it. Unknown result
+        types fall back to a minimal id + result_type so nothing silently
+        vanishes.
+        """
+        rtype = r.get('result_type')
+        if rtype == 'ticket':
+            return {
+                'result_type': 'ticket',
+                'id': r.get('id'),
+                'subject': r.get('subject'),
+                'status': r.get('status'),
+                'priority': r.get('priority'),
+                'type': r.get('type'),
+                'created_at': r.get('created_at'),
+                'updated_at': r.get('updated_at'),
+                'requester_id': r.get('requester_id'),
+                'assignee_id': r.get('assignee_id'),
+                'organization_id': r.get('organization_id'),
+                'tags': r.get('tags', []),
+            }
+        if rtype == 'user':
+            return {
+                'result_type': 'user',
+                'id': r.get('id'),
+                'name': r.get('name'),
+                'email': r.get('email'),
+                'role': r.get('role'),
+                'active': r.get('active'),
+                'organization_id': r.get('organization_id'),
+            }
+        if rtype in ('organization', 'group'):
+            return {
+                'result_type': rtype,
+                'id': r.get('id'),
+                'name': r.get('name'),
+            }
+        return {'result_type': rtype, 'id': r.get('id')}
 
     def get_satisfaction_ratings(
         self,
@@ -557,8 +609,20 @@ class ZendeskClient:
             with urllib.request.urlopen(req) as response:
                 data = json.loads(response.read().decode())
 
+            ratings = [{
+                'id': r.get('id'),
+                'assignee_id': r.get('assignee_id'),
+                'requester_id': r.get('requester_id'),
+                'group_id': r.get('group_id'),
+                'ticket_id': r.get('ticket_id'),
+                'score': r.get('score'),
+                'comment': r.get('comment'),
+                'reason': r.get('reason'),
+                'created_at': r.get('created_at'),
+                'updated_at': r.get('updated_at'),
+            } for r in data.get('satisfaction_ratings', [])]
             return {
-                'satisfaction_ratings': data.get('satisfaction_ratings', []),
+                'satisfaction_ratings': ratings,
                 'count': data.get('count', 0),
                 'page': page,
                 'per_page': per_page,
