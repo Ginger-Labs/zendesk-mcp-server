@@ -15,3 +15,6 @@ wheels/
 .env
 .env.prod
 .env.dev
+
+# OAuth gateway spike local state
+oauth-gateway/.gateway-data/
