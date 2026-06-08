@@ -12,8 +12,9 @@ from typing import Any, Dict
 from cachetools.func import ttl_cache
 from dotenv import load_dotenv
 from mcp.server import InitializationOptions, NotificationOptions
-from mcp.server import Server, types
+from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from mcp import types
 from pydantic import AnyUrl
 
 from zendesk_mcp_server.zendesk_client import ZendeskClient
@@ -961,22 +962,91 @@ async def handle_read_resource(uri: AnyUrl) -> str:
         raise
 
 
-async def main():
-    # Run the server using stdin/stdout streams
+def _init_options() -> InitializationOptions:
+    return InitializationOptions(
+        server_name="Zendesk",
+        server_version="0.1.0",
+        capabilities=server.get_capabilities(
+            notification_options=NotificationOptions(),
+            experimental_capabilities={},
+        ),
+    )
+
+
+async def run_stdio() -> None:
+    """Local transport: speak MCP over stdin/stdout (used by local hosts and CI)."""
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream=read_stream,
-            write_stream=write_stream,
-            initialization_options=InitializationOptions(
-                server_name="Zendesk",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
+        await server.run(read_stream, write_stream, _init_options())
+
+
+def _build_streamable_http_app():
+    """Starlette app exposing the server at POST/GET /mcp over Streamable HTTP."""
+    import contextlib
+
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    # stateless=True keeps each request self-contained (no server-side session
+    # store), which is the simplest thing that works behind a load balancer and
+    # for one-shot clients like `claude -p`. Flip to False for resumable/SSE
+    # streaming sessions once a gateway/session store is in front of it.
+    manager = StreamableHTTPSessionManager(app=server, json_response=False, stateless=True)
+
+    async def handle_mcp(scope, receive, send):
+        await manager.handle_request(scope, receive, send)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        async with manager.run():
+            yield
+
+    return Starlette(routes=[Mount("/mcp", app=handle_mcp)], lifespan=lifespan)
+
+
+def _build_sse_app():
+    """Starlette app exposing the legacy SSE transport (GET /sse, POST /messages)."""
+    from mcp.server.sse import SseServerTransport
+    from starlette.applications import Starlette
+    from starlette.responses import Response
+    from starlette.routing import Mount, Route
+
+    sse = SseServerTransport("/messages/")
+
+    async def handle_sse(request):
+        async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, _init_options())
+        return Response()
+
+    return Starlette(routes=[
+        Route("/sse", endpoint=handle_sse, methods=["GET"]),
+        Mount("/messages/", app=sse.handle_post_message),
+    ])
+
+
+def _run_http(build_app) -> None:
+    import uvicorn
+
+    host = os.getenv("ZENDESK_MCP_HOST", "127.0.0.1")
+    port = int(os.getenv("ZENDESK_MCP_PORT", "8000"))
+    logger.info(f"serving MCP over HTTP on {host}:{port}")
+    uvicorn.run(build_app(), host=host, port=port, log_level="info")
+
+
+def main() -> None:
+    """Entrypoint. Transport chosen by ZENDESK_MCP_TRANSPORT (default: stdio)."""
+    transport = os.getenv("ZENDESK_MCP_TRANSPORT", "stdio").lower()
+    if transport == "stdio":
+        asyncio.run(run_stdio())
+    elif transport in ("streamable-http", "http", "streamable_http"):
+        _run_http(_build_streamable_http_app)
+    elif transport == "sse":
+        _run_http(_build_sse_app)
+    else:
+        raise SystemExit(
+            f"Unknown ZENDESK_MCP_TRANSPORT={transport!r}; use 'stdio', 'streamable-http', or 'sse'."
         )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
