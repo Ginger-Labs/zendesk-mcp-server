@@ -122,6 +122,19 @@ Full-text search across Zendesk via the Search API (`/api/v2/search.json`). Unli
 
 - Output: Returns matching results with pagination metadata (count, has_more, next_page, previous_page)
 
+### search_ticket_comments
+
+Keyword search over what users actually wrote — ticket subject, description, and comment bodies. This is the `search` tool scoped to `type:ticket`: pass plain words or a quoted phrase (e.g. `cannot export pdf`, `"sync error"`) and they are full-text matched against ticket text. Reach for `search` instead when you need field qualifiers like `status:open` or `requester:...`.
+
+- Input:
+  - `text` (string): Words or quoted phrase to find in ticket text
+  - `sort_by` (string, optional): Field to sort by - created_at, updated_at, priority, status
+  - `sort_order` (string, optional): Sort order - asc or desc
+  - `page` (integer, optional): Page number (defaults to 1)
+  - `per_page` (integer, optional): Results per page, max 100 (defaults to 25)
+
+- Output: Same shape as `search` — trimmed ticket summaries with pagination metadata
+
 ### get_satisfaction_ratings
 
 List CSAT / satisfaction ratings via the Satisfaction Ratings API (`/api/v2/satisfaction_ratings.json`). Each rating includes `assignee_id`, `score` (good/bad), `comment`, `ticket_id`, and timestamps. There is no server-side agent filter — to rank CSAT per agent, fetch ratings (optionally filtered by score and date range) and group by `assignee_id` client-side.
@@ -197,6 +210,15 @@ Retrieve all comments for a Zendesk ticket by its ID
 
 - Input:
   - `ticket_id` (integer): The ID of the ticket to get comments for
+
+### get_ticket_comments_batch
+
+Fetch all comments for multiple tickets in a single call. Takes an array of ticket ids and fetches them in parallel (thread pool), returning one entry per ticket in request order. Use this instead of calling `get_ticket_comments` once per ticket when reading across many tickets — for example, to spot trends in what users wrote.
+
+- Input:
+  - `ticket_ids` (array[integer]): Zendesk ticket ids to fetch comments for
+
+- Output: `count` and `tickets`, a list of per-ticket results in request order — each either `{ticket_id, comments}` (same comment shape as `get_ticket_comments`) or `{ticket_id, error}` if that ticket failed (one bad ticket never sinks the batch)
 
 ### get_ticket_attachment
 

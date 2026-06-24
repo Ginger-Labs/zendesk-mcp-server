@@ -235,6 +235,42 @@ class ZendeskClient:
         except Exception as e:
             raise Exception(f"Failed to get comments for ticket {ticket_id}: {str(e)}")
 
+    def get_ticket_comments_batch(self, ticket_ids: List[int]) -> Dict[str, Any]:
+        """
+        Fetch comments for several tickets in one call, in parallel.
+
+        Searching Zendesk for trends means reading what people wrote across many
+        tickets at once; doing that one `get_ticket_comments` call at a time is
+        slow. As with `get_views_batch`, zenpy is blocking, so we fan the
+        per-ticket fetches out across a thread pool — wall-clock cost is roughly
+        the slowest single ticket rather than their sum.
+
+        Args:
+            ticket_ids: Zendesk ticket ids to fetch comments for.
+
+        Returns:
+            Dict with `count` (tickets requested) and `tickets`, a list of
+            per-ticket results in the same order as `ticket_ids`. Each entry is
+            either `{'ticket_id': id, 'comments': [...]}` (same comment shape as
+            `get_ticket_comments`) or `{'ticket_id': id, 'error': msg}` if that
+            ticket failed — one bad ticket never sinks the batch.
+        """
+        if not ticket_ids:
+            return {'count': 0, 'tickets': []}
+
+        max_workers = min(len(ticket_ids), 10)
+
+        def fetch_one(ticket_id: int) -> Dict[str, Any]:
+            try:
+                return {'ticket_id': ticket_id, 'comments': self.get_ticket_comments(ticket_id)}
+            except Exception as e:
+                return {'ticket_id': ticket_id, 'error': str(e)}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(fetch_one, ticket_ids))
+
+        return {'count': len(results), 'tickets': results}
+
     # Allowed MIME types. Two groups:
     #   1. Safe images (no SVG — it can carry XML/JS).
     #   2. ZIP-shaped binary bundles. Notability .ntb files are zip archives; logs.zip is zip.
@@ -550,6 +586,45 @@ class ZendeskClient:
                 'name': r.get('name'),
             }
         return {'result_type': rtype, 'id': r.get('id')}
+
+    def search_ticket_comments(
+        self,
+        text: str,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+        page: int = 1,
+        per_page: int = 25,
+    ) -> Dict[str, Any]:
+        """
+        Keyword search over the text users actually wrote — ticket subject,
+        description, and comment bodies.
+
+        This is the generic `search` scoped to `type:ticket`. It exists as its
+        own method (and tool) so the keyword is searched against ticket content
+        rather than being read as Zendesk query syntax: a bare phrase like
+        `cannot export pdf` is passed straight through to the Search API, which
+        full-text matches it against ticket text. Use plain words/quoted phrases
+        here; reach for `search` when you need field qualifiers (status:open,
+        requester:..., created>...).
+
+        Args:
+            text: Words or quoted phrase to find in ticket text.
+            sort_by: Optional field to sort by (created_at, updated_at, etc.).
+            sort_order: Optional sort order (asc or desc).
+            page: Page number (1-based).
+            per_page: Results per page (max 100).
+
+        Returns:
+            Same shape as `search` — trimmed ticket summaries plus pagination.
+        """
+        return self.search(
+            query=text,
+            type='ticket',
+            sort_by=sort_by,
+            sort_order=sort_order,
+            page=page,
+            per_page=per_page,
+        )
 
     def get_satisfaction_ratings(
         self,
