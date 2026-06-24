@@ -246,6 +246,69 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="get_ticket_comments_batch",
+            description=(
+                "Fetch all comments for multiple tickets in a single call. "
+                "Takes an array of ticket ids and fetches them in parallel "
+                "(thread pool), returning one entry per ticket in request order. "
+                "Use this instead of calling get_ticket_comments once per ticket "
+                "when reading across many tickets (e.g. to spot trends in what "
+                "users wrote). A failing ticket returns {ticket_id, error} "
+                "instead of sinking the batch."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Zendesk ticket ids to fetch comments for"
+                    }
+                },
+                "required": ["ticket_ids"]
+            }
+        ),
+        types.Tool(
+            name="search_ticket_comments",
+            description=(
+                "Keyword search over what users actually wrote — ticket subject, "
+                "description, and comment bodies. Use this when looking for "
+                "tickets that mention specific words or phrases (e.g. 'cannot "
+                "export pdf', 'sync error'); pass plain words or a quoted phrase "
+                "and they are full-text matched against ticket text. This is the "
+                "`search` tool scoped to tickets; reach for `search` instead when "
+                "you need field qualifiers like status:open or requester:..."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Words or quoted phrase to find in ticket text"
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": "Field to sort by (created_at, updated_at, priority, status)"
+                    },
+                    "sort_order": {
+                        "type": "string",
+                        "description": "Sort order (asc or desc)"
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Page number",
+                        "default": 1
+                    },
+                    "per_page": {
+                        "type": "integer",
+                        "description": "Results per page (max 100)",
+                        "default": 25
+                    }
+                },
+                "required": ["text"]
+            }
+        ),
+        types.Tool(
             name="create_ticket_comment",
             description="Create a new comment on an existing Zendesk ticket",
             inputSchema={
@@ -808,6 +871,30 @@ def _dispatch_tool(
         return [types.TextContent(
             type="text",
             text=json.dumps(comments)
+        )]
+
+    elif name == "get_ticket_comments_batch":
+        if not arguments or "ticket_ids" not in arguments:
+            raise ValueError("Missing required argument: ticket_ids")
+        result = zendesk_client.get_ticket_comments_batch(arguments["ticket_ids"])
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(result)
+        )]
+
+    elif name == "search_ticket_comments":
+        if not arguments or not arguments.get("text"):
+            raise ValueError("Missing required argument: text")
+        results = zendesk_client.search_ticket_comments(
+            text=arguments["text"],
+            sort_by=arguments.get("sort_by"),
+            sort_order=arguments.get("sort_order"),
+            page=arguments.get("page", 1),
+            per_page=arguments.get("per_page", 25),
+        )
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(results, indent=2)
         )]
 
     elif name == "create_ticket_comment":
