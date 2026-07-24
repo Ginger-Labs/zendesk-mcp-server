@@ -5,6 +5,7 @@ import urllib.request
 import urllib.parse
 import base64
 import requests as _requests
+from urllib3.util import parse_url as _parse_url
 
 from zenpy import Zenpy
 from zenpy.lib.api_objects import Comment
@@ -307,6 +308,91 @@ class ZendeskClient:
     # routinely run 5-20 MB when they carry imported PDFs.
     _MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
+    _ATTACHMENT_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+
+    @staticmethod
+    def _attachment_url_parts(url: str) -> tuple[str, str]:
+        """Return (scheme, host), lowercased, parsed the SAME way requests/urllib3
+        will CONNECT — deliberately NOT urllib.parse.
+
+        The two parsers disagree on hosts urllib.parse mis-attributes: e.g.
+        ``https://evil.com\\@ok.zendesk.com/`` has hostname ``ok.zendesk.com`` under
+        urllib.parse but urllib3/requests connects to ``evil.com``. Validating the
+        host with a different parser than the one that opens the socket is an
+        allowlist bypass, so we parse with urllib3 here. Returns ("", "") if the
+        URL is unparseable (→ rejected)."""
+        try:
+            parsed = _parse_url(url)
+        except Exception:
+            return "", ""
+        return (parsed.scheme or "").lower(), (parsed.host or "").lower()
+
+    @staticmethod
+    def _is_zendesk_owned(host: str) -> bool:
+        return (
+            host == "zendesk.com" or host.endswith(".zendesk.com")
+            or host == "zdusercontent.com" or host.endswith(".zdusercontent.com")
+        )
+
+    def _attachment_host_allowed(self, url: str, *, with_auth: bool) -> bool:
+        """Whether we may fetch ``url``. Always requires https + a Zendesk-owned
+        host. When ``with_auth`` (the Zendesk credential will be attached) the host
+        must be THIS tenant's own subdomain — the only place this account's
+        content_urls live and the only host the credential should ever reach.
+        Credential-free hops (after a cross-host redirect) may also touch the CDN
+        or other Zendesk hosts, keeping SSRF contained to Zendesk infrastructure."""
+        scheme, host = self._attachment_url_parts(url)
+        if scheme != "https" or not host:
+            return False
+        if with_auth:
+            return host == f"{self.subdomain}.zendesk.com".lower()
+        return self._is_zendesk_owned(host)
+
+    def _fetch_attachment_response(self, url: str, max_hops: int = 5):
+        """GET an attachment, following redirects MANUALLY.
+
+        Every hop is re-validated BEFORE the request, using the same parser that
+        opens the socket (closing parser-differential allowlist bypasses); the
+        host must be https and Zendesk-owned; and the Zendesk credential is sent
+        ONLY to this tenant's own subdomain — dropped on the first cross-host hop
+        and never reattached. Returns the final streamed response.
+        """
+        current = url
+        send_auth = True
+        for _ in range(max_hops + 1):
+            if not self._attachment_host_allowed(current, with_auth=send_auth):
+                scheme, host = self._attachment_url_parts(current)
+                if scheme != "https":
+                    raise ValueError(
+                        f"Refusing to fetch attachment over non-https URL (host '{host}')."
+                    )
+                if send_auth and self._is_zendesk_owned(host):
+                    raise ValueError(
+                        f"Refusing to send Zendesk credentials to foreign host '{host}' "
+                        f"(expected {self.subdomain}.zendesk.com)."
+                    )
+                raise ValueError(
+                    f"Refusing to fetch attachment from non-Zendesk host '{host}'."
+                )
+            headers = {'Authorization': self.auth_header} if send_auth else {}
+            response = _requests.get(
+                current, headers=headers, timeout=30, stream=True, allow_redirects=False
+            )
+            if response.status_code in self._ATTACHMENT_REDIRECT_CODES:
+                location = response.headers.get('Location')
+                response.close()
+                if not location:
+                    raise ValueError("Attachment redirect response had no Location header.")
+                nxt = urllib.parse.urljoin(current, location)
+                _, cur_host = self._attachment_url_parts(current)
+                _, nxt_host = self._attachment_url_parts(nxt)
+                if nxt_host != cur_host:
+                    send_auth = False  # never send our Zendesk credential to a different host
+                current = nxt
+                continue
+            return response
+        raise ValueError("Too many redirects while fetching attachment.")
+
     def get_ticket_attachment(self, content_url: str) -> Dict[str, Any]:
         """
         Fetch an attachment and return base64-encoded data.
@@ -319,17 +405,17 @@ class ZendeskClient:
           so the binary allowlist is not a blank cheque for arbitrary content.
         - 25 MB size cap to prevent image bombs and excessive token usage.
 
-        Zendesk attachment URLs redirect to zdusercontent.com (Zendesk's CDN).
-        requests strips the Authorization header on cross-origin redirects,
-        which is required — the CDN returns 403 if it receives an auth header.
+        content_url originates from ticket/comment data, which is attacker-
+        influenced (a malicious ticket could plant a bogus content_url), so a
+        prompt-injection could try to coax the model into leaking our Zendesk
+        credential. The fetch (see _fetch_attachment_response) defends against
+        that: it is https-only, validates every hop's host with the SAME parser
+        that opens the socket, sends the credential ONLY to this tenant's own
+        subdomain, and refuses any non-Zendesk host — no redirect can launder the
+        request off Zendesk infrastructure or onto an attacker's host.
         """
         try:
-            response = _requests.get(
-                content_url,
-                headers={'Authorization': self.auth_header},
-                timeout=30,
-                stream=True,
-            )
+            response = self._fetch_attachment_response(content_url)
             response.raise_for_status()
 
             content_type = response.headers.get('Content-Type', '').split(';')[0].strip().lower()
